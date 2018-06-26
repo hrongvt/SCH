@@ -1,2 +1,971 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+get update
+#get boiler plate for GLUE
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import SparkSession
+from pyspark.sql import SQLContext
+from pyspark.sql import HiveContext
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.context import StorageLevel
+from pyspark.context import SparkConf
+from pyspark.sql.functions import col , column
+
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+sqlContext = HiveContext(sc)
+spark = glueContext.spark_session
+
+#--------------load all the look up tables ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
+
+term_table     = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="term_table")
+term_table.toDF().registerTempTable('term_table')
+
+department     = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="departments_csv")
+department.toDF().registerTempTable('department')
+
+colleges       = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="colleges").toDF().where("college_code <>'college_code'")
+colleges.registerTempTable('colleges')
+
+majors         = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="majors_pibb_csv")
+majors.toDF().registerTempTable('majors')
+
+coursesubject  = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="coursesubject")
+coursesubject.toDF().registerTempTable('coursesubject')
+
+pibbmap        = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="pibb_mapp_srmgt")
+pibbmap.toDF().registerTempTable('pibbmap')
+
+spriden_id_map = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="spriden_id")
+spriden_id_map.toDF().registerTempTable('spriden_id_map')
+
+crosslist      = glueContext.create_dynamic_frame.from_catalog( database ="sch-teaching",table_name ="adssitedefault_public_ssrxlst")
+crosslist.toDF().registerTempTable('ssrxlst')
+
+pell_elog_1112_1718 = glueContext.create_dynamic_frame.from_catalog( database ="sch-teaching", table_name ="adssitedefault_public_pell_elig_1112_1718")
+pell_elog_1112_1718.toDF().registerTempTable('pell_elog')
+
+orgdept        = glueContext.create_dynamic_frame.from_catalog( database ="lookuptable",table_name ="orgdept")
+orgdept.toDF().registerTempTable('orgdept')
+
+pibb_map = spark.sql("""select substr(col2,2,4) as dept_code,substr(col3,2,2) as srmgt_code from pibbmap""")
+pibb_map.registerTempTable('pibb_map')
+
+#-------------define function to run the whole program based on term and year--------------------------------------------------------------------------------------------
+
+def getSCHdetail(term,year,termmonth,month):
+
+#-------------define the functions to load course and student course data------------------------------------------------------------------------------------------
+
+    def readcourses(term, year):
+    
+        def generalcourses (term, year):
+    
+            tablename  ='adssitedefault_public_bcx'+term +'1'+year
+            bcx_glue   = glueContext.create_dynamic_frame.from_catalog(
+                                 database ="enrollment",
+                                 table_name =tablename)
+            bcx_orig     = bcx_glue.toDF().select (['regterm', 'regcrn', 'regtitl', 'sectitl', 'regcrlow', 'secsubj','regcrhig','regcoll','regdept', 'seccnum', 'seccamp', 'secacct', 'secschd']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' ").sort('regcrn').distinct()
+            bcx_orig.registerTempTable('bcx_orig') 
+            bcx = spark.sql("""select * from
+                            (select *,row_number() over (partition by regterm,regcrn order by regcrn) as row_number  from bcx_orig)
+                            where row_number =1""")
+            return bcx
+    
+        def combinedcourses(term, year):
+    
+            tablename1 ='adssitedefault_public_bcx'+term +'1'+year+'_gr'
+            tablename2 ='adssitedefault_public_bcx'+term +'1'+year+'_ug'
+            bcx_glue_gr = glueContext.create_dynamic_frame.from_catalog(
+                                 database ="enrollment",
+                                 table_name =tablename1)
+            bcx_glue_ug = glueContext.create_dynamic_frame.from_catalog(
+                                 database ="enrollment",
+                                 table_name =tablename2)
+            bcx_gr  =bcx_glue_gr.toDF().select (['regterm', 'regcrn', 'regtitl', 'sectitl', 'regcrlow', 'secsubj','regcrhig','regcoll','regdept', 'seccnum', 'seccamp', 'secacct', 'secschd']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' ").sort('regcrn').distinct()
+            bcx_ug  =bcx_glue_ug.toDF().select (['regterm', 'regcrn', 'regtitl', 'sectitl', 'regcrlow', 'secsubj','regcrhig','regcoll','regdept', 'seccnum', 'seccamp', 'secacct', 'secschd']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' ").sort('regcrn').distinct()
+            bcx_orig=bcx_gr.union(bcx_ug).distinct()
+        
+            bcx_orig .registerTempTable('bcx_orig ')
+            bcx = spark.sql("""select * from
+                            (select *,row_number() over (partition by regterm,regcrn order by regcrn) as row_number  from bcx_orig )
+                            where row_number =1""")
+            bcx.registerTempTable('bcx')
+            return bcx
+        
+        if (term =='fa' and year =='13') or (term =='sp' and year =='14') or (term =='fa' and year =='14') or (term =='sp' and year =='15') :
+            course = combinedcourses(term,year)
+        else: course =generalcourses(term,year)
+    
+        return course
+    
+    def readstudentcourses(term, year):    
+        def generalstucourses (term, year):
+        
+            tablename  ='adssitedefault_public_bcx'+term +'1'+year
+            bcx_glue   = glueContext.create_dynamic_frame.from_catalog(
+                                     database ="enrollment",
+                                     table_name =tablename)
+            bcxstu_short     = bcx_glue.toDF().select (['pidm','regterm','regcrn', 'major','secsubj','reggmod','regcrhr']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' and reggmod not in ('A','W')").sort('regcrn').distinct()
+            bcxstu_short.registerTempTable('bcxstu_short') 
+            bcxstu     = spark.sql("""select bcxstu_short.*, spriden_id_map. spriden_id from bcxstu_short left join spriden_id_map on bcxstu_short.pidm = spriden_id_map.pidm """)
+            bcxstu.registerTempTable('bcxstu')
+            return bcxstu
+    
+        def combinedstucourses(term, year):
+        
+            tablename1 ='adssitedefault_public_bcx'+term +'1'+year+'_gr'
+            tablename2 ='adssitedefault_public_bcx'+term +'1'+year+'_ug'
+            bcx_glue_gr= glueContext.create_dynamic_frame.from_catalog(
+                                     database ="enrollment",
+                                     table_name =tablename1)
+            bcx_glue_ug = glueContext.create_dynamic_frame.from_catalog(
+                                     database ="enrollment",
+                                     table_name =tablename2)
+            bcxstu_gr  =bcx_glue_gr.toDF().select (['pidm','regterm','regcrn', 'major','secsubj','reggmod','regcrhr']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' and reggmod not in ('A','W') and reglevl in ('GR','MD','PR') ")
+            bcxstu_ug  =bcx_glue_ug.toDF().select (['pidm','regterm','regcrn', 'major','secsubj','reggmod','regcrhr']).where("substring(secschd,1,1)<>'Z' and secsubj <> 'REG' and reggmod not in ('A','W') and reglevl in ('AS','UG') ")
+            bcxstu_short     =bcxstu_gr.union(bcxstu_ug).distinct()
+            bcxstu_short.registerTempTable('bcxstu_short')
+            bcxstu     =spark.sql("""select bcxstu_short.*, spriden_id_map. spriden_id from bcxstu_short left join spriden_id_map on bcxstu_short.pidm = spriden_id_map.pidm """)
+            bcxstu.registerTempTable('bcxstu')
+            return bcxstu
+    
+    
+        if (term =='fa' and year =='13') or (term =='sp' and year =='14') or (term =='fa' and year =='14') or (term =='sp' and year =='15') :
+            stucourse = combinedstucourses(term,year)
+        else: stucourse =generalstucourses(term,year)
+        return stucourse
+
+#-------------read and filter course and student course by using function defined and parameter on term and year -----------------------------------
+
+    course_one= readcourses(term,year).registerTempTable('course_one')   
+
+    courses = spark.sql(""" select regterm, regcrn, regtitl, sectitl,regcrlow as regcr_low, regcrhig as regcr_high,secsubj,regcoll,regdept, seccnum,seccamp,secacct, secschd as course_type_code,
+        case when substr(seccnum,1,1) <= "4"  then "UG"
+             when substr(seccnum,1,1) = "5"   then "MS"
+             when substr(seccnum,1,1) in ("6","7") then "DR"
+             when substr(seccnum,1,1) in ("8","9") then "PR"
+             when substr(seccnum,1,1) >= "5" then "GR"
+             else "XX"
+        end as course_level,
+        case when substr(secschd,1,1) = "B" then  "Lab"
+             when substr(secschd,1,1) = "C" then "Recitation"
+             when substr(secschd,1,1) = "I" then  "Independent Study"
+             when substr(secschd,1,1) = "L" then  "Lecture"
+             when substr(secschd,1,1) = "R" then  "Research"
+             when substr(secschd,1,1) = "V" and substr(secschd,2,1) = "B" then  "Virtual Lab"
+             when substr(secschd,1,1) = "V" and substr(secschd,2,1) = "C" then  "Virtual Recitation"
+             when substr(secschd,1,1) = "V" and substr(secschd,2,1) = "I" then  "Virtual Independent Study"
+             when substr(secschd,1,1) = "V" and substr(secschd,2,1) = "L" then  "Virtual Lecture"
+             when substr(secschd,1,1) = "V" and substr(secschd,2,1) = "R" then  "Virtual Research"
+             else  "XXXX"
+        end as course_type,
+        case when secsubj = "UH" or substr(seccnum,5,1) = "H" then  "Y"
+             else "N"
+        end as honors_course
+       from course_one
+       """)
+    courses.registerTempTable('courses')
+    
+    crosslist = spark.sql("""select ssrxlst_term_code as term, ssrxlst_xlst_group as crosslist_code, ssrxlst_crn as crn from ssrxlst""")
+    crosslist.registerTempTable('crosslist')
+    
+    courses_out = spark.sql("""select a.regterm as term, 
+                      a.regcrn as crn, 
+                      a.secsubj as course_subject, 
+                      a.regcoll,
+                      c.dept_code as course_dept, 
+                      a.seccnum as course_number,
+                      a.regtitl as course_title, 
+                      a.sectitl as course_subtitle, 
+                      a.regcr_low as credit_low, 
+                      a.regcr_high as credit_high,
+                      a.honors_course, 
+                      b.crosslist_code as orig_crosslist_code,
+                      count(b.crosslist_code) Over(partition by b.term, b.crosslist_code)as count, 
+                      case when count(b.crosslist_code) Over(partition by b.term, b.crosslist_code) =1 then null
+                      else b.crosslist_code 
+                      end as crosslist_code,
+                      a.course_level, 
+                      a.course_type, 
+                      a.course_type_code,
+                      a.seccamp as campus_code, 
+                      a.secacct as site_code
+    from courses a
+    left join
+	 crosslist b
+    on a.regterm = b.term and a.regcrn = b.crn
+    left join
+     coursesubject c
+    on a.secsubj = c.secsubj
+    order by a.regterm, b.crosslist_code
+    """)
+    courses_out.registerTempTable('courses_out')
+    
+#----------read and filter student course data -------------------------------------------------------------------------------------------------------------------
+
+    studentcourse_one =readstudentcourses(term,year).registerTempTable('studentcourse_one')
+    
+    student_courses = spark.sql("""select pidm, spriden_id,regterm as term, regcrn as crn, regcrhr as credit,major,
+    case when reggmod = "E" then "Equivalent Credit"
+        when reggmod = "N" then  "A - F"
+        when reggmod = "P" then "Pass/Fail"
+        when reggmod = "R" then  "Repeated Course"
+        when reggmod = "T" then  "Transfer"
+        when reggmod = "X" then "Deferred"
+        when reggmod = "Y" then "Credit Hours Only"
+        when reggmod = "Z" then "Committee Action"
+        else "XXXX"
+        
+        end as grade_mode
+    from studentcourse_one
+    order by regterm, regcrn, pidm
+    """)
+    student_courses.registerTempTable('student_courses')
+    
+#---------read faculty data---------------------------------------------------------------------------------------------------------------------------------------------
+    def readfaculty (year,month,termmonth):
+        if month == 'sep':
+                tablename  ='adssitedefault_public_pt'+ '30' + month + year
+        elif month in ( 'mar', 'may', 'jul'):
+                tablename  ='adssitedefault_public_pt'+ '31' + month + year
+        elif month == 'dec':
+                tablename  ='adssitedefault_public_pt'+ '31' + month + str(int(year)-1)  
+        else:
+                tablename  ='adssitedefault_public_pt'+ '31' + month + year
+    
+            
+        faculty_glue   = glueContext.create_dynamic_frame.from_catalog(
+                                     database ="sch-teaching",
+                                     table_name =tablename)
+                                     
+        faculty_glue.toDF().registerTempTable('faculty_glue')    
+            
+        sqlquery = """
+            select a.entity_identifier as vt_id, 
+                   {0} as term, 
+                   a.current_last_name,
+                   a.fundfte, 
+                   a.fte,
+                   b.payroll_dept_code  as payroll_dept_code, 
+                   a.sr_management_code ,
+                   a.sr_management_desc 
+            from faculty_glue as a
+            left join orgdept as b on a.fundorg = b.fundorg
+            where a.termjob = 'N'  
+              and a.fundfte > 0.000
+              and a.lwop1 = 'N' 
+              and a.lwop2 = 'N'
+              and (a.faculty_staff_annual_sal_amt > 0 or a.jobsal > 0) 
+              and substr(a.agency_maj,1,3) = '208'
+              and a.jobdesc not in ('Emergency Hire','Federal Work Study','Non-Student Wage','Sporadic/Seasonal/Game Worker','Student Wage') 
+              and a.eeo6code not in ('50','60','70') 
+            """.format(termmonth)
+        return spark.sql(sqlquery)
+
+    faculty = readfaculty(year,month,termmonth)    
+    faculty.registerTempTable('faculty')
+    
+    pibb_faculty_pct208_fte_factype = spark.sql("""
+    with cte as (
+            select term, vt_id, sum(fundfte) as sum_fte 
+            from faculty
+            group by term, vt_id )
+    select a.term,
+       a.vt_id,
+       a.payroll_dept_code,
+       a.sr_management_code,
+       case when a.payroll_dept_code = '0176' then '05' else p.srmgt_code end as srmgt_code,
+       a.current_last_name,
+       round(a.fundfte/ cte.sum_fte,4) as payroll_percent
+    from faculty as a left join cte 
+    on a.term= cte.term and a.vt_id = cte.vt_id
+    left join pibb_map as p 
+    on a.payroll_dept_code =p.dept_code
+     """)
+    pibb_faculty_pct208_fte_factype.registerTempTable('pibb_faculty_pct208_fte_factype') 
+
+#-------------load banner table and get instructor assignment info----------------------------------------------------------------------------------------
+    spriden  = glueContext.create_dynamic_frame.from_catalog(
+                                                         database ="sch-teaching",
+                                                         table_name ="adssitedefault_public_spriden")
+    spriden.toDF().registerTempTable('spriden')
+
+    szrhscr  = glueContext.create_dynamic_frame.from_catalog(
+                                                         database ="sch-teaching",
+                                                         table_name ="adssitedefault_public_szrhscr")
+    szrhscr.toDF().where("szrhscr_term_code = {}  and szrhscr_date_id in ('A', 'C')".format(termmonth)).registerTempTable('szrhscr')
+
+    szrhtix = glueContext.create_dynamic_frame.from_catalog(
+                                                         database ="sch-teaching",
+                                                         table_name ="adssitedefault_public_szrhtix")
+    szrhtix.toDF().where("szrhtix_term_code = {} and szrhtix_date_id in ('A', 'C') and szrhtix_assign_this_instructor = 'Y'".format(termmonth)). registerTempTable('szrhtix')
+
+    szbhsec = glueContext.create_dynamic_frame.from_catalog(
+                                                         database ="sch-teaching",
+                                                         table_name ="adssitedefault_public_szbhsec")
+    szbhsec.toDF().registerTempTable('szbhsec')
+
+    szrhsgn = glueContext.create_dynamic_frame.from_catalog(
+                                                         database ="sch-teaching",
+                                                         table_name ="adssitedefault_public_szrhsgn")
+    szrhsgn= szrhsgn.resolveChoice(specs = [('szrhsgn_split_code','cast:long')])
+    szrhsgn.toDF().where("szrhsgn_term_code = {} and szrhsgn_date_id in ('A', 'C')".format(termmonth)).registerTempTable('szrhsgn')
+
+#--------------load scf data with updates scf_tuition%------------------------------------------------------------------------------------------------------------------
+    def read_scf (term, year):
+        tablename = 'adssitedefault_public_scf'+ term + '3' + year
+        scf = glueContext.create_dynamic_frame.from_catalog(
+                    database ="enrollment",table_name = tablename)
+        scf.toDF().registerTempTable('scf')
+        
+        return scf
+        
+    def read_scf2 (term, year):
+        tablename = 'adssitedefault_public_scf_tuition_'+ term + '3' + year
+        scf = glueContext.create_dynamic_frame.from_catalog(
+                    database ="enrollment",table_name = tablename)
+        scf.toDF().registerTempTable('scf')
+        
+        return scf
+    
+    scf = read_scf(term, year)
+        
+#---------------get individaul course assigned and organizational course assigned and join with student course to get student course assigned----------------------------------------------    
+    
+    individual_inst_assignment = spark.sql("""
+    select a.szrhtix_term_code, 
+       a.szrhtix_crn, 
+       a.szrhtix_pidm, 
+       c.spriden_id,
+	   d.szbhsec_subj_code,
+	   d.szbhsec_crse_numb,
+	   a.szrhtix_stu_pidm, 
+	   a.szrhtix_stu_credit_hrs,
+	   b.szrhscr_split_code, 
+	   a.szrhtix_percent_stu_credit_hrs,
+	   c.spriden_change_ind
+    from szrhtix a, szrhscr b, spriden c, szbhsec d
+    where  a.szrhtix_term_code = b.szrhscr_term_code
+     and a.szrhtix_crn = b.szrhscr_crn
+     and c.spriden_change_ind is null
+     and a.szrhtix_pidm = c.spriden_pidm
+     and a.szrhtix_term_code = d.szbhsec_term_code
+     and a.szrhtix_crn = d.szbhsec_crn 
+      """)
+
+    individual_inst_assignment.registerTempTable('individual_inst_assignment')
+
+    org_class_assignment = spark.sql( """
+    select distinct a.szrhsgn_term_code, 
+       a.szrhsgn_crn, 
+       a.szrhsgn_pidm,
+       b. spriden_id, 
+       d.szbhsec_subj_code, 
+       d.szbhsec_crse_numb, 
+       a.szrhsgn_prof_percent_sess, 
+       a.szrhsgn_dept_receiving_credit, 
+       c.szrhscr_crn, 
+       c.szrhscr_split_code,
+       c.szrhscr_credit_hours
+    from szrhsgn a, spriden b, szrhscr c, szbhsec d
+    where  b.spriden_change_ind is null
+    and a.szrhsgn_pidm = b.spriden_pidm
+    and a.szrhsgn_term_code = d.szbhsec_term_code
+    and a.szrhsgn_crn = d.szbhsec_crn
+    and a.szrhsgn_term_code= c.SZRHSCR_term_code
+    and a.szrhsgn_crn =c.szrhscr_crn
+    and a.szrhsgn_split_code = c.szrhscr_split_code
+    and concat(a.szrhsgn_term_code,a.szrhsgn_crn) not in (select distinct concat( szrhtix_term_code , szrhtix_crn) from szrhtix  )
+    order by szrhsgn_term_code, szrhsgn_crn
+      """)
+
+    org_class_assignment.registerTempTable('org_class_assignment')
+
+    reg_temp = spark.sql( """
+    select a.term,
+       a.crn,
+       a.pidm,
+       a.spriden_id,
+       a.major as student_major,
+       b.spriden_id as instructor_id,
+       b.szbhsec_subj_code as subject_code,
+       b.szbhsec_crse_numb as course_number,
+       b.szrhtix_stu_credit_hrs as credit_hours,
+       b.szrhtix_percent_stu_credit_hrs as Percentage,
+       b.szrhscr_split_code as split_code
+    from student_courses as a
+    left join individual_inst_assignment as b
+    	on a.term = b.szrhtix_term_code
+    	and a.crn = b.szrhtix_crn
+    	and a.pidm = b.szrhtix_stu_pidm
+    	   """)
+
+    reg_temp.registerTempTable('reg_temp')
+    
+    reg_org = spark.sql("""
+    select distinct a.term
+       ,a.crn
+       ,a.pidm
+       ,a.spriden_id
+       ,a.student_major
+       ,b.spriden_id as instructor_id
+	   ,b.szbhsec_subj_code as subject_code
+	   ,b.szbhsec_crse_numb as course_number
+	   ,b.szrhscr_credit_hours as credit_hours
+	   ,b.szrhsgn_prof_percent_sess as Percentage
+	   ,b.szrhscr_split_code as split_code
+    from reg_temp as a
+	left join org_class_assignment as b
+	on a.term = b.szrhsgn_term_code
+	and a.crn = b.szrhscr_crn
+    where a.instructor_id is null
+    """)
+    
+    reg_org.registerTempTable('reg_org')
+    
+    all_reg = reg_temp.where("instructor_id is not null").union(reg_org)
+    
+    no_map_reg = all_reg.where("instructor_id is null")
+
+    no_map_reg.registerTempTable('no_map_reg')
+
+    map_reg = all_reg.where("instructor_id is not null")
+    map_reg.registerTempTable('map_reg')
+    
+    no_map = spark.sql("""
+    select a.term, 
+       a.crn, 
+       a.pidm, 
+       a.spriden_id,
+       a.student_major,
+       b.szbhsec_subj_code as subject_code, 
+       b.szbhsec_crse_numb as course_number,
+	   a.instructor_id, 
+	   a.credit_hours, 
+	   a.percentage,
+	   a.split_code
+    from no_map_reg as a 
+    left join szbhsec as b
+    on a.term = b.szbhsec_term_code and a.crn = b.szbhsec_crn
+    """)
+    no_map.registerTempTable('no_map')
+    
+    student_courses_assigned = map_reg.union(no_map)
+    student_courses_assigned.registerTempTable('student_courses_assigned')
+    
+#--------SCH calculation----------------------------------------------------------------------------------------------#
+ #----------join with courses out------------------------------------------------------------------------------------------
+    assigned = spark.sql( """with cte as (
+    select  sc.term
+            ,sc.crn
+            ,sc.pidm
+            ,sc.student_major
+            ,sc.spriden_id
+            ,sc.subject_code
+            ,sc.course_number
+            ,sc.instructor_id
+            ,sc.credit_hours
+            ,sc.percentage
+            ,sc.split_code
+            ,c.crosslist_code
+            ,c.course_type_code
+            ,c.course_title 
+    from student_courses_assigned as sc
+    left join courses_out as c
+          on sc.term = c.term 
+          and sc.crn = c.crn
+    where sc.credit_hours is not null
+    )
+    select term,crn,pidm,student_major,spriden_id,subject_code,course_number,instructor_id,credit_hours,percentage,split_code,course_type_code,course_title,
+         case when crosslist_code <> '' then CONCAT(term, crosslist_code)
+             else crn 
+             end as crn2
+    from cte
+    """)
+    assigned.registerTempTable('assigned')
+    
+    class_size = spark.sql("""
+    select term, 
+           crn2, 
+           count(distinct pidm) as session_size 
+    from (select * from assigned
+    except
+    (select * from assigned 
+    where   substr(course_type_code,1,1)  in ('I', 'R') 
+        or  substr(course_type_code,2,1)  in ('I', 'R')
+        or  UPPER(course_title) like  '%INTERNSHIP%' 
+        or  UPPER(course_title) like  '%INDEPENDENT%'
+        or  UPPER(course_title) like  '%PRACTICUM%' 
+        or  UPPER(course_title) like  '%EXTERNSHIP%' 
+        or  UPPER(course_title) like  '%RESEARCH AND DISSERTATION%'
+        or  UPPER(course_title) like  '%RESEARCH AND THESIS%'
+        or  UPPER(course_title) like  '%DEFENDING%'
+        or  course_title = 'Final Examination' 
+        ))
+    group by term, crn2
+    """)
+    class_size.registerTempTable('class_size')
+
+  #-------------------join with class size-------------------------------------------------------------------------------------------------
+    
+    assigned2 = spark.sql("""
+    select asg.*, 
+          cs.session_size,
+          case when substr(scf.heg,1,3)  = 'REA' then 'REAL'
+               else scf.heg 
+               end as major_code,
+          case when scf.race_ethn_code_ipeds in (1, 3, 4, 6) then  "Y"
+               when scf.race_ethn_code_IPEDS = 7 and (scf.ethn_hispanic_latino = 1 or scf.race_black_african_amer = 1 or scf.race_hawaii_pacific_isles = 1 or scf.race_amer_indn_alaska_natv = 1) then  "Y"
+               else "N"
+          end as urm,
+          scf.firstgen_yn as firstgen_yn,
+          scf.lvl,
+          case when substring(scf.tuition_rate_adj, 1,4) in ('EMBA', 'PMBA', 'XMNR' ) then substring(scf.tuition_rate_adj, 1,4) 
+               when scf.heg = 'BXBR' then 'BXBR'
+          end as prof_program,
+          case when substring(scf.tuition_rate_adj,1,4) in ('EMBA', 'PMBA', 'XMNR' )  or  scf.heg = 'BXBR' then 'PROF'
+               when substring({0}, 5,2) in ('06', '07') then 'Summer'
+               when substring({0}, 5,2) in ('12') then  'Winter'
+               else 'PIBB'
+          end as budget_model,
+          virtual_student_yn
+    from assigned as asg
+    	left join class_size as cs
+    	on asg.term = cs.term and asg.crn2 = cs.crn2
+    	left join scf
+    	on asg.pidm = scf.id
+    """.format(termmonth))
+    assigned2.registerTempTable('assigned2')
+   
+  #-------------------join with courses out , majors-----------------------------------------------------------------------------------
+    assigned3 = spark.sql("""
+    select asg2.*, 
+           c.honors_course, 
+           c.crosslist_code,
+    	   c.course_level, 
+    	   c.course_type, 
+    	   c.course_dept,
+    	   m.dept_code as student_dept,
+    	   c.campus_code, 
+    	   c.site_code,
+    	   case when pell.aid_year <> ' ' or  asg2.firstgen_yn = 'Y' then 'Y'
+    	        else 'N'
+    	   end as uss
+    from assigned2 as asg2
+        left join courses_out as c
+        on asg2.term = c.term and asg2.crn = c.crn
+        left join majors as m
+        on asg2.major_code = m.major_code
+        left join pell_elog as pell
+        on asg2.term = pell.aid_term and asg2.pidm = pell.pidm
+    """)
+    assigned3.registerTempTable('assigned3')
+ 
+   #---------------join  with department-------------------------------------------------------------------------------------------------------    
+    assigned4 = spark.sql("""
+    select asg3.*,
+           b.college_code as student_college, 
+           c.college_code as course_college
+    from assigned3 as asg3
+    left join department as b
+    on asg3.student_dept = b.dept_code
+    left join department as c
+    on asg3.course_dept = c.dept_code
+    """)
+    assigned4.registerTempTable('assigned4')
+    
+    assigned5 = spark.sql("""
+    select instructor_id, 
+           spriden_id, 
+           credit_hours, 
+           site_code, 
+           percentage, 
+           subject_code, 
+           crosslist_code, 
+           crn2, 
+           campus_code,  
+           course_type_code, 
+           course_type, 
+           pidm, 
+           course_level, 
+           session_size, 
+           course_dept, 
+           course_title, 
+           honors_course, 
+           student_dept, 
+           split_code, 
+           course_number, 
+           crn, 
+           student_major, 
+           major_code,
+           lvl,
+           urm, 
+           uss, 
+           term,
+    	   case when course_college>'10' then '06'
+    	        else course_college 
+    	   end as course_college,
+    	   case when student_college>'10' then '06'
+    	        else student_college 
+    	   end as student_college,
+    	   prof_program,
+    	   budget_model,
+    	   virtual_student_yn
+    from assigned4 
+    """)
+    assigned5.registerTempTable('assigned5')
+    
+   #-------------------join with faculty pay roll data ------------------------------------------------------------------------------------------
+    assigned6= spark.sql("""
+    select asg5.*, 
+           f208.payroll_percent, 
+           f208.payroll_dept_code, 
+           f208.srmgt_code as payroll_srmgt , 
+           f208.current_last_name as instructor_LN
+    from assigned5 as asg5
+    	left join pibb_faculty_pct208_fte_factype as f208
+    	on asg5.term = f208.term and asg5.instructor_id = f208.vt_id
+    """)
+    assigned6.registerTempTable('assigned6')
+    
+    assigned7 = spark.sql("""
+    select *,
+                case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then credit_hours * percentage/100 * payroll_percent * 0.8
+                     when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') 
+                     then credit_hours * percentage/100 * payroll_percent * 0.8
+		             when payroll_percent is not null then credit_hours * percentage/100 *payroll_percent * 0.8
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then credit_hours * percentage/100 * 0.8
+                end as sch_fac,
+                
+		        case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then credit_hours * percentage/100 * payroll_percent * 0.2
+                     when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43')
+                     then credit_hours * percentage/100 * payroll_percent * 0.2
+		             when payroll_percent is not null then credit_hours * percentage/100 *payroll_percent * 0.2
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then credit_hours * percentage/100 *  0.2
+		        end as sch_sub,
+		        
+		        case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then payroll_dept_code
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43')  then payroll_dept_code
+		             when payroll_percent is not null then course_dept
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then course_dept 
+		        end as sch_fac_dept,
+		        
+		        case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then payroll_dept_code
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43')  then course_dept
+		             when payroll_percent is not null  then course_dept
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then course_dept
+		        end as sch_sub_dept,
+		        
+	        	case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then payroll_srmgt
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43')  then payroll_srmgt
+		             when payroll_percent is not null  then course_college
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then course_college
+		        end as sch_fac_coll,
+		        
+		        case when course_college = '06' and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43') then payroll_srmgt
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_srmgt in ('01', '02', '03', '05', '07', '08', '09', '10', '45', '43')  then course_college
+		             when payroll_percent is not null  then course_college
+		             when course_college in ('01', '02', '03', '05', '07', '08', '09', '10') and payroll_percent  is null then course_college
+		        end as sch_sub_coll,
+		        
+		        case   when student_college is null then 'Y'
+		               when student_college <> course_college then  'Y' 
+		               else 'N' 
+		        end as other_major,
+		        
+		        case when course_college = '03' and session_size >= 30 and session_size <= 60 then  'Y'
+                     when course_college in ('01', '02', '05', '06', '07', '08', '09', '10') and session_size >= 15 and session_size <= 40 then  'Y'
+	                 else 'N'
+	            end as session_size_in_range,
+	            
+	            case when crosslist_code is null then 'N' else 'Y' end as crosslisted
+	            
+            from assigned6
+    """)
+    assigned7.registerTempTable('assigned7')
+
+#---------generate enterprize funding data and join in-------------------------------------------------------------------------------------------------------
+    
+    assigned8 = spark.sql("""
+    select *,
+     case when major_code = 'EDCI' and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code in ('EDIT') then  'ITMA'
+     when major_code = 'ALS'  and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code in ('AAEC','ALCE','ALS','BSE','CSES','ENT','FST','HNFE','HORT','LDRS','PPWS', 'APSC') then 'PSAL'
+     when major_code = 'PSCI' and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code in ('PSCI','GIA','HIST') then 'PSE'
+     when major_code in ('AE', 'OCE','OE') and lvl >= 70 and lvl < 96 and virtual_student_yn = 'Y' and subject_code = 'AOE' then 'AOE'
+     when major_code = 'IT' and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code in ('ECE','CS') then 'MITE'
+     when major_code = 'IT' and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code in ('BIT','MGT','ACIS') then 'MITB'
+     when major_code ='MNR' and lvl >= 70 and lvl < 96   and virtual_student_yn = 'Y' and subject_code = 'NR' then 'MNRC'
+     when subject_code = 'NSEG' and course_number in ('5114', '5124', '5204', '5214', '5604', '5974', '5984') then 'NSEG'
+     when subject_code = 'MSE' and course_number = '5384G' then 'NSEG'
+     when subject_code = 'NSEG' and course_number in ('6124','6984') then 'NSEG'
+     when subject_code = 'PAPA' and course_number in ('5044','6154','6354','5784') then 'LGMC'
+     when subject_code = 'SPIA' and course_number in ('5514','5544','5574','5534','5524') then 'NNOM'
+     when subject_code = 'EDCI' and course_number = 5774 then 'ATLE'
+    end as efprogram
+    from assigned7
+    """)
+    assigned8.registerTempTable('assigned8')
+    
+    gvm_list = spark.sql("""
+    select distinct term, crn, efprogram from assigned8
+    where efprogram <> ''
+    """)
+    gvm_list.registerTempTable('gvm_list')
+    
+#--the logic is: if one of the student qualify for efprogram then the rest of virtual student in that course are categorized as efprogram as well    
+
+    assigned9 = spark.sql("""
+    select a.*, b.efprogram as efprogram_all
+    from assigned8 as a 
+    left join gvm_list as b 
+    on a.crn = b.crn
+    and virtual_student_yn = 'Y'
+    """)
+    assigned9.registerTempTable('assigned9')
+    
+    SCH_assigned_detail = spark.sql("""
+    select *,
+    case when efprogram_all <> '' then 'Enterprise'
+         else budget_model
+    end as budget_model_b,
+    case when efprogram_all <> '' then  'Y'
+         else null
+    end as gvm
+    from assigned9
+    """)
+    
+    return SCH_assigned_detail  
+    
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#-------------------------------------Calculate SCH aggregated detail and SCH aggregated-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+def SCH_aggregated_detail(term,year,termmonth,month):
+
+    SCHdetail= getSCHdetail(term,year,termmonth,month)
+    SCHdetail_c = SCHdetail.withColumn("sch_sub", col("sch_sub").cast("decimal(10,4)")).withColumn("sch_fac", col("sch_fac").cast("decimal(10,4)"))
+    SCHdetail.registerTempTable('SCHdetail')
+    
+    #--------------------sink SCH assinged detail to postgreSQL------------------------------------------------------------------------------------------------------------------------
+    
+    DFSCH_assigned_detail_c =  DynamicFrame.fromDF(SCHdetail_c, glueContext, "SCH_assigned_detail")
+    glueContext.write_dynamic_frame.from_jdbc_conf( frame = DFSCH_assigned_detail_c, catalog_connection = "vtf_postgresql", connection_options = {"dbtable":"pibb_bridge.SCH_assigned_detail", "database":"AdssiteDefault"})
+    
+    #---------------------calculate SCH aggregated detail----------------------------------------------------------------------------------------------------------------------------------
+    
+    assigned10 = spark.sql("""
+    select term
+        , payroll_srmgt
+        , payroll_dept_code
+        , crn
+        , subject_code
+        , course_number
+        , course_title
+		, course_type
+		, course_level
+		, crosslisted
+		, session_size
+		, session_size_in_range
+		, honors_course
+		, other_major
+		, course_college
+		, course_dept
+		, instructor_id
+		, instructor_LN
+		, credit_hours
+		, percentage
+		, urm
+		, uss
+		, payroll_percent
+		, "Payroll Dept" as SCH_category
+		, sum(sch_fac) as SCH
+		, sch_fac_dept as Attributed_Dept
+		, sch_fac_coll as Attributed_College
+		, budget_model_b as budget_model
+		, prof_program
+		, efprogram_all as efprogram
+	from SCHdetail
+	group by  term, payroll_srmgt, payroll_dept_code, crn, subject_code, course_number, course_title, course_type, crosslisted, session_size, session_size_in_range, honors_course, other_major, course_college, course_dept, course_level, instructor_id, instructor_LN, credit_hours, percentage, urm, uss, payroll_percent, sch_fac_dept,sch_fac_coll, budget_model_b, prof_program, efprogram_all
+	union all
+	select term
+	    , payroll_srmgt
+	    , payroll_dept_code
+	    , crn
+	    , subject_code
+	    , course_number
+	    , course_title
+		, course_type
+		, course_level
+		, crosslisted
+		, session_size
+		, session_size_in_range
+		, honors_course
+		, other_major
+		, course_college
+		, course_dept
+		, instructor_id
+		, instructor_LN
+		, credit_hours
+		, percentage
+		, urm
+		, uss
+		, payroll_percent
+		, "Dept Offering" as SCH_category
+		, sum(sch_sub) as SCH
+		, sch_sub_dept as Attributed_Dept
+		, sch_sub_coll as Attributed_College
+		, budget_model_b as budget_model
+		, prof_program
+		, efprogram_all as efprogram
+	from SCHdetail
+	group by term, payroll_srmgt, payroll_dept_code, crn, subject_code, course_number, course_title, course_type, crosslisted, session_size, session_size_in_range, honors_course, other_major, course_college, course_dept,course_level, instructor_id, instructor_LN, credit_hours, percentage,  urm, uss, payroll_percent, sch_sub_dept,sch_sub_coll, budget_model_b, prof_program, efprogram_all
+    """)
+    assigned10.registerTempTable('assigned10')
+    
+    SCH_Aggregated_detail = spark.sql("""
+    select term
+        , payroll_srmgt
+        , payroll_dept_code
+        , crn
+        , subject_code
+        , course_number
+        , course_title
+    	, course_type
+    	, crosslisted
+    	, session_size
+    	, session_size_in_range
+    	, honors_course
+    	, other_major
+    	, course_college
+    	, course_dept
+    	, course_level
+    	, instructor_id
+    	, instructor_LN
+    	, credit_hours
+    	, percentage
+    	, urm
+    	, uss
+    	, payroll_percent
+    	, SCH_category
+    	, Attributed_Dept
+    	, Attributed_College
+    	, budget_model
+    	, prof_program
+    	, efprogram
+    	, sum(SCH) as SCH 
+    	from assigned10
+    	group by term, payroll_srmgt, payroll_dept_code, crn, subject_code, course_number, course_title, course_type, crosslisted, session_size, session_size_in_range, honors_course, other_major, course_college, course_dept,course_level, instructor_id, instructor_LN, credit_hours, percentage, urm, uss, payroll_percent, SCH_category, Attributed_Dept, Attributed_College, budget_model, prof_program, efprogram
+    """)
+    SCH_Aggregated_detail.registerTempTable('SCH_Aggregated_detail')
+    
+    #-------------------sink SCH_Aggregated_detail to postgreSQL------------------------------------------------------------------------------------------------------------------------------------------------
+    
+    DFSCH_Aggregated_detail =  DynamicFrame.fromDF(SCH_Aggregated_detail, glueContext, "SCH_Aggregated_detail")
+    glueContext.write_dynamic_frame.from_jdbc_conf( frame = DFSCH_Aggregated_detail,catalog_connection = "vtf_postgresql",connection_options = {"dbtable":"pibb_bridge.SCH_Aggregated_detail", "database":"AdssiteDefault"})
+    
+    #--------------------calculate SCH_Aggregated-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+    
+    sch_temp =spark.sql("""
+    select b.academic_year, 
+        a.term
+        , a.honors_course
+        , a.other_major
+    	, a.session_size_in_range
+    	, a.Attributed_dept as attributed_dept_code
+    	, a.attributed_college as attributed_College_code
+    	, a.sch_category
+    	, a.course_level
+    	, a.urm
+    	, a.uss
+    	, a.budget_model
+    	, a.prof_program
+    	, a.efprogram
+    	, sum(a.SCH) as SCH
+    	from SCH_Aggregated_detail as a
+    	left join term_table as b
+    	on a.term = b.term_code
+    	group by b.academic_year, a.term, a.honors_course, a.other_major, a.session_size_in_range, a.Attributed_dept, a.attributed_college, a.course_level, a.urm, a.uss,a.sch_category, a.budget_model, a.prof_program, a.efprogram
+    	""")
+    sch_temp.registerTempTable('sch_temp')
+    
+    SCH_Aggregated = spark.sql("""
+    select a.academic_year
+        , a.term
+        , d.fiscal_year
+        , a.honors_course
+        , a.other_major
+        , a.session_size_in_range
+        , a.attributed_dept_code
+        , b.dept_name as attributed_dept_name
+        , a.course_level
+        , a.urm
+        , a.uss
+        , a.budget_model
+    	, a.prof_program
+    	, a.efprogram
+        , a.attributed_College_code
+        , c.college_name as attributed_college_name
+        , a.sch_category
+        , a.sch 
+        from sch_temp a
+        left join department as b on a.attributed_dept_code = b.dept_code 
+        left join colleges as c on a.attributed_college_code = c.college_code 
+        left join term_table as d on a.term = d.term_code 
+        where a.attributed_college_code <> '' 
+        """)
+    #--------------sink SCH aggregated to postgreSQL --------------------------------------------------------------------------------------------------------
+    
+    DFSCH_Aggregated =  DynamicFrame.fromDF(SCH_Aggregated, glueContext, "SCH_Aggregated")
+    glueContext.write_dynamic_frame.from_jdbc_conf( frame = DFSCH_Aggregated,catalog_connection = "vtf_postgresql",connection_options = {"dbtable":"pibb_bridge.SCH_Aggregated", "database":"AdssiteDefault"})    
+    return 
+  
+#SCH_aggregated_detail('fs','11','201106','may')
+'''SCH_aggregated_detail('ss','11','201107','jul')
+SCH_aggregated_detail('fa','11','201109','sep')
+
+SCH_aggregated_detail('sp','12','201201','mar')
+SCH_aggregated_detail('fs','12','201206','may')
+SCH_aggregated_detail('ss','12','201207','jul')
+SCH_aggregated_detail('fa','12','201209','sep')
+
+SCH_aggregated_detail('sp','13','201301','mar')
+SCH_aggregated_detail('fs','13','201306','may')
+SCH_aggregated_detail('ss','13','201307','jul')
+SCH_aggregated_detail('fa','13','201309','sep')
+SCH_aggregated_detail('wn','14','201312','dec')
+
+SCH_aggregated_detail('sp','14','201401','mar')
+SCH_aggregated_detail('fs','14','201406','may')
+SCH_aggregated_detail('ss','14','201407','jul')
+SCH_aggregated_detail('fa','14','201409','sep')
+SCH_aggregated_detail('wn','15','201412','dec')
+
+SCH_aggregated_detail('sp','15','201501','mar')
+SCH_aggregated_detail('fs','15','201506','may')
+SCH_aggregated_detail('ss','15','201507','jul')
+SCH_aggregated_detail('fa','15','201509','sep')
+SCH_aggregated_detail('wn','16','201512','dec')
+
+SCH_aggregated_detail('sp','16','201601','mar')
+SCH_aggregated_detail('fs','16','201606','may')
+SCH_aggregated_detail('ss','16','201607','jul')
+SCH_aggregated_detail('fa','16','201609','sep')
+SCH_aggregated_detail('wn','17','201612','dec')
+
+
+SCH_aggregated_detail('sp','17','201701','mar')
+SCH_aggregated_detail('fs','17','201706','may')
+SCH_aggregated_detail('ss','17','201707','jul')
+SCH_aggregated_detail('fa','17','201709','sep')
+SCH_aggregated_detail('wn','18','201712','dec')
+
+SCH_aggregated_detail('sp','18','201801','mar')'''
+
+SCH_aggregated_detail('wn','18','201712','dec')
+SCH_aggregated_detail('sp','18','201801','mar')
+
